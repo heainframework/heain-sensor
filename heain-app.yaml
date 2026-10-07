@@ -1,0 +1,43 @@
+# heain-sensor v1 (Step 4.6g, 2026-10-07): readings from devices outside the trust boundary (ESP32-class).
+# Devices are not nodes and hold no certificate of the deployment (spec 00 section 3): each has its own key and signs
+# every post (HMAC-SHA256, a sequence number against replay) over HTTPS on a separate listener. Readings are stored
+# sealed per device (delete = crypto-shred), marked untrusted_source, kept for a retention ceiling, read by apps the
+# device names. Alert rules (changed through P5) tell people through heain-notify and become formal events in core;
+# only those results reach core (spec 00 section 4). Apps queue commands that devices pick up; risky ones need P5.
+manifest_version: 1
+app:
+  id: heain-sensor
+  version: 1.0.0
+  group: base
+  description: Device ingest (ESP32-class, untrusted source) -- signed readings, sealed time series, alert rules through P5, commands to devices.
+  api: v1
+  sdk: {name: heain-sdk-go, version: ">=1.0.0"}
+capabilities:
+  - {name: sensor.admin, version: 1, formal: true, execution: direct, ai: {used: false}, data_classes: [sensor_readings]}
+  - {name: sensor.read, version: 1, formal: true, execution: direct, ai: {used: false}, data_classes: [sensor_readings]}
+  - {name: sensor.command, version: 1, formal: true, execution: direct, ai: {used: false}}
+  # device registry and ingest (posts refused are recorded under it)
+  - {name: sensor.ingest, version: 1, formal: true, execution: direct, ai: {used: false}, data_classes: [sensor_readings]}
+  # alerts raised and resolved are recorded under it
+  - {name: sensor.alert, version: 1, formal: true, execution: direct, ai: {used: false}}
+endpoints:
+  - {method: POST, path: /v1/devices, capability: sensor.admin, formal: true, public: true}
+  - {method: GET, path: /v1/devices, capability: sensor.ingest, formal: false, public: true}
+  - {method: GET, path: "/v1/devices/{id}", capability: sensor.ingest, formal: false, public: true}
+  - {method: POST, path: "/v1/devices/{id}/rotate", capability: sensor.admin, formal: true, public: true}
+  - {method: POST, path: "/v1/devices/{id}/revoke", capability: sensor.admin, formal: true, public: true}
+  - {method: DELETE, path: "/v1/devices/{id}", capability: sensor.admin, formal: true, public: true}
+  - {method: GET, path: "/v1/devices/{id}/readings", capability: sensor.read, formal: true, public: true}
+  - {method: PUT, path: "/v1/rules/{id}", capability: sensor.admin, formal: true, public: true}
+  - {method: DELETE, path: "/v1/rules/{id}", capability: sensor.admin, formal: true, public: true}
+  - {method: GET, path: /v1/rules, capability: sensor.admin, formal: false, public: true}
+  - {method: GET, path: /v1/alerts, capability: sensor.alert, formal: false, public: true}
+  - {method: POST, path: "/v1/devices/{id}/commands", capability: sensor.command, formal: true, public: true}
+  - {method: GET, path: "/v1/commands/{id}", capability: sensor.command, formal: false, public: true}
+uses:
+  - {app: heain-notify, capabilities: [notify.send]}
+data_classes:
+  - {name: sensor_readings, sovereignty: node-local, trust: untrusted_source, encrypted_at_rest: true, crypto_shred: true, retention: {max: 30d}}
+offline:
+  allowed: [sensor.read, sensor.command]
+  journal: none

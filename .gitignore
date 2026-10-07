@@ -1,0 +1,4 @@
+/heain-sensor
+/device-sim
+*.db
+conf-dev.*

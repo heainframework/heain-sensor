@@ -1,0 +1,22 @@
+# heain-sensor under the heain conformance suite (heain-sdk conformance/). The suite's probe app is an admin caller.
+# The device listener needs a TLS certificate, so start makes a throwaway self-signed one. The samples check validation,
+# access and errors without registering a device (a device's key is shown once, so a rerun cannot repeat it).
+# scripts/live_4_6g.sh runs devices, signed posts, alert rules through P5, commands, rotation and deletion end to end.
+manifest: heain-app.yaml
+build: [go, build, -o, heain-sensor, ./cmd/heain-sensor]
+start: [sh, -c, "openssl req -x509 -newkey rsa:2048 -nodes -keyout conf-dev.key -out conf-dev.pem -days 1 -subj /CN=127.0.0.1 >/dev/null 2>&1 && exec ./heain-sensor -device-listen 127.0.0.1:0 -device-cert conf-dev.pem -device-key conf-dev.key -admin-callers conformance-probe -poll 1s"]
+port: 19570
+endpoints:
+  - {method: POST, path: /v1/devices, body: {id: "bad id/x", name: conformance-secret-name, metrics: [{name: temp}]}, expect: 400, secret: conformance-secret-name}
+  - {method: GET, path: /v1/devices, expect: 200}
+  - {method: GET, path: /v1/devices/conf-d, expect: 404}
+  - {method: POST, path: /v1/devices/conf-d/rotate, expect: 404}
+  - {method: POST, path: /v1/devices/conf-d/revoke, expect: 404}
+  - {method: DELETE, path: /v1/devices/conf-d, expect: 404}
+  - {method: GET, path: "/v1/devices/conf-d/readings?metric=temp", expect: 404}
+  - {method: GET, path: /v1/rules, expect: 200}
+  - {method: PUT, path: /v1/rules/conf-r, body: {device: conf-d, kind: threshold, metric: temp, op: "~", value: 1}, expect: 400}
+  - {method: DELETE, path: /v1/rules/conf-r, expect: 404}
+  - {method: GET, path: /v1/alerts, expect: 200}
+  - {method: POST, path: /v1/devices/conf-d/commands, body: {name: fan, args: {secret: conformance-secret-arg}}, expect: 404, secret: conformance-secret-arg}
+  - {method: GET, path: /v1/commands/conf-c, expect: 404}
