@@ -28,6 +28,7 @@ var (
 	bRules    = []byte("rules")
 	bAlerts   = []byte("alerts")
 	bCommands = []byte("commands")
+	bOutbox   = []byte("outbox")
 )
 
 // ErrNotFound: no such record.
@@ -58,7 +59,7 @@ func Open(path string, inside []byte, keys Keys) (*Store, error) {
 		return nil, err
 	}
 	if err := db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bDevices, bSecrets, bReadings, bRules, bAlerts, bCommands} {
+		for _, b := range [][]byte{bDevices, bSecrets, bReadings, bRules, bAlerts, bCommands, bOutbox} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -368,6 +369,17 @@ type RuleSpec struct {
 	For      string   `json:"for,omitempty"` // threshold: consecutive readings; silence: a duration ("5m")
 	Severity string   `json:"severity"`      // info | warning | critical
 	Notify   []string `json:"notify,omitempty"`
+	// WhileSilent (v1.1, threshold rules): the rule counts only while that
+	// device has been silent for For -- a cautious stand-in approved through
+	// P5 in advance (a lower threshold on a neighbouring gauge while the
+	// main one is out).
+	WhileSilent *Silent `json:"while_silent,omitempty"`
+}
+
+// Silent names a device and how long it must have been silent.
+type Silent struct {
+	Device string `json:"device"`
+	For    string `json:"for"`
 }
 
 // Rule is a rule with its pending change.
@@ -471,6 +483,42 @@ func (s *Store) Cmds() []Cmd {
 		var c Cmd
 		if json.Unmarshal(raw, &c) == nil {
 			out = append(out, c)
+		}
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].Created.Before(out[j].Created) })
+	return out
+}
+
+// ---- notices waiting for heain-notify (v1.1) ----
+
+// Notice is an alert notice not yet taken by heain-notify; it is retried
+// until heain-notify takes it (idempotency key = ID) or it is too old.
+type Notice struct {
+	ID       string    `json:"id"`
+	To       []string  `json:"to"`
+	Kind     string    `json:"kind"`
+	Title    string    `json:"title"`
+	Ref      string    `json:"ref"`
+	Severity string    `json:"severity"`
+	Attempts int       `json:"attempts"`
+	Next     time.Time `json:"next"`
+	LastErr  string    `json:"last_error,omitempty"`
+	Created  time.Time `json:"created"`
+}
+
+// PutNotice stores a notice.
+func (s *Store) PutNotice(n Notice) error { return s.put(bOutbox, "notice", n.ID, n) }
+
+// DelNotice removes one.
+func (s *Store) DelNotice(id string) error { return s.del(bOutbox, "notice", id) }
+
+// Notices lists them, oldest first.
+func (s *Store) Notices() []Notice {
+	out := []Notice{}
+	s.each(bOutbox, "notice", func(raw []byte) {
+		var n Notice
+		if json.Unmarshal(raw, &n) == nil {
+			out = append(out, n)
 		}
 	})
 	sort.Slice(out, func(i, j int) bool { return out[i].Created.Before(out[j].Created) })

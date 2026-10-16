@@ -1,4 +1,5 @@
-# heain-sensor v1 (Step 4.6g, 2026-10-07): readings from devices outside the trust boundary (ESP32-class).
+# heain-sensor v1.1 (v1: Step 4.6g, 2026-10-07; v1.1, disaster-warning case 2026-10-17: alert notices kept until heain-notify
+# v1.1 takes them, cautious stand-in rules while a device is silent, readings kept up to 400 days for seasonal hazards): readings from devices outside the trust boundary (ESP32-class).
 # Devices are not nodes and hold no certificate of the deployment (spec 00 section 3): each has its own key and signs
 # every post (HMAC-SHA256, a sequence number against replay) over HTTPS on a separate listener. Readings are stored
 # sealed per device (delete = crypto-shred), marked untrusted_source, kept for a retention ceiling, read by apps the
@@ -7,7 +8,7 @@
 manifest_version: 1
 app:
   id: heain-sensor
-  version: 1.0.0
+  version: 1.1.0
   group: base
   description: Device ingest (ESP32-class, untrusted source) -- signed readings, sealed time series, alert rules through P5, commands to devices.
   api: v1
@@ -32,12 +33,14 @@ endpoints:
   - {method: DELETE, path: "/v1/rules/{id}", capability: sensor.admin, formal: true, public: true}
   - {method: GET, path: /v1/rules, capability: sensor.admin, formal: false, public: true}
   - {method: GET, path: /v1/alerts, capability: sensor.alert, formal: false, public: true}
+  # v1.1: alert notices heain-notify has not taken yet (kept and retried)
+  - {method: GET, path: /v1/notices, capability: sensor.alert, formal: false, public: true}
   - {method: POST, path: "/v1/devices/{id}/commands", capability: sensor.command, formal: true, public: true}
   - {method: GET, path: "/v1/commands/{id}", capability: sensor.command, formal: false, public: true}
 uses:
-  - {app: heain-notify, capabilities: [notify.send]}
+  - {app: heain-notify, capabilities: [notify.send]}   # v1.1 (idempotency_key)
 data_classes:
-  - {name: sensor_readings, sovereignty: node-local, trust: untrusted_source, encrypted_at_rest: true, crypto_shred: true, retention: {max: 30d}}
+  - {name: sensor_readings, sovereignty: node-local, trust: untrusted_source, encrypted_at_rest: true, crypto_shred: true, retention: {max: 400d}}
 offline:
   allowed: [sensor.read, sensor.command]
   journal: none

@@ -92,6 +92,7 @@ func (e *Engine) Register(srv *heain.Server) error {
 		"DELETE /v1/rules/{id}":          e.delRule,
 		"GET /v1/rules":                  e.rules,
 		"GET /v1/alerts":                 e.alerts,
+		"GET /v1/notices":                e.notices,
 		"POST /v1/devices/{id}/commands": e.command,
 		"GET /v1/commands/{id}":          e.getCommand,
 	} {
@@ -226,6 +227,13 @@ func (e *Engine) rules(w http.ResponseWriter, r *http.Request) {
 func (e *Engine) alerts(w http.ResponseWriter, r *http.Request) {
 	if _, ok := e.mustAdmin(w, r); ok {
 		reply(w, http.StatusOK, map[string]any{"alerts": e.Store.Alerts(), "trust": Trust})
+	}
+}
+
+// notices: alert notices heain-notify has not taken yet (v1.1).
+func (e *Engine) notices(w http.ResponseWriter, r *http.Request) {
+	if _, ok := e.mustAdmin(w, r); ok {
+		reply(w, http.StatusOK, map[string]any{"pending": e.Pending()})
 	}
 }
 

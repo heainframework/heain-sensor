@@ -13,8 +13,24 @@ Built on [heain-sdk](https://github.com/heainframework/heain-sdk) v1. It passes 
 
 1. **A key per device, HMAC on every request.** A device cannot hold a heain mTLS identity, so an admin (an `-admin-callers` app, or a person with the `sensor-admin` role through heain-gateway) registers it and receives a 256-bit key once. Each post carries `X-Device-Id`, `X-Device-Seq` (strictly increasing), `X-Device-Time` (within 10 min) and `X-Device-Signature`; the answer is signed back. Keys rotate; a revoked device is refused at once.
 2. **HTTPS first.** Devices post to a separate HTTPS listener (`-device-listen`, default `:8570`) with the operator's certificate. MQTT can come later, behind the same signing.
-3. **heain-sensor keeps the readings.** Node-local, sealed under the device's key in core's KMS, kept for 30 days by default (`-retention`), queried by metric and time. Values outside the declared range are kept but marked `implausible`; undeclared metrics are dropped.
+3. **heain-sensor keeps the readings.** Node-local, sealed under the device's key in core's KMS, kept for 30 days by default (`-retention`, at most 400 days since v1.1), queried by metric and time. Values outside the declared range are kept but marked `implausible`; undeclared metrics are dropped.
 4. **Commands through a queue; risky ones through P5.** Controller apps queue a command; the device receives it in its next signed answer and reports `done` or `failed`. A command declared `risky` is a P5 proposal (`sensor.command`) first. Commands expire (1 h by default).
+
+## v1.1 (2026-10-17)
+
+These were added for the national disaster-warning case study. heain-sensor v1.1 needs **heain-notify v1.1**, because of the idempotency key.
+
+- **Alert notices are kept until heain-notify takes them.**
+  - Each notice is stored first, then handed to heain-notify.
+  - If notify is down or restarting, the notice is retried after 5 s, 15 s, 30 s, 1 min, 2 min, then every 5 min. Every retry carries the same `idempotency_key`, so the notice arrives once.
+  - A notice notify never takes is given up after `-notice-max-age` (24 h).
+  - Each step is recorded in core: `notice_queued`, `notice_delivered_late` (with the delay), `notice_given_up`.
+  - `GET /v1/notices` lists what is still waiting.
+- **Cautious stand-in rules.**
+  - A threshold rule may say `"while_silent": {"device": "<id>", "for": "10m"}`. It then counts only while that device has been silent for that long.
+  - Use it for a lower threshold on a neighbouring gauge while the main one is out, approved through P5 in advance like any rule.
+  - When the main device reports again, the stand-in stops counting and its alert resolves.
+- **Readings may be kept up to 400 days** (`-retention`; the manifest's ceiling is now `400d`). This allows seasonal comparisons, such as a PM2.5 season against last year's. The default stays 30 days.
 
 ## Signing
 
@@ -38,6 +54,7 @@ Wrong key, replayed sequence, old time, unknown or revoked device: 401. Over `-r
 | `GET /v1/devices/{id}/readings?metric=&from=&to=&limit=` | admins, readers |
 | `PUT /v1/rules/{id} {device \| "type:x", kind: threshold \| silence, metric, op, value, for, severity, notify}`, `DELETE /v1/rules/{id}` (202, through P5 `sensor.rule.change`), `GET /v1/rules` | admins |
 | `GET /v1/alerts` | admins |
+| `GET /v1/notices` (v1.1: alert notices heain-notify has not taken yet) | admins |
 | `POST /v1/devices/{id}/commands {name, args, ttl_s}`, `GET /v1/commands/{id}` | admins, controllers |
 
 A threshold rule's `for` is how many readings in a row must break it; a silence rule's `for` is a duration.

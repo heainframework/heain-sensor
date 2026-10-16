@@ -36,10 +36,14 @@ func main() {
 	devKey := flag.String("device-key", os.Getenv("HEAIN_SENSOR_DEVICE_KEY"), "its private key")
 	adminCallers := flag.String("admin-callers", os.Getenv("HEAIN_SENSOR_ADMIN_CALLERS"), "comma-separated app ids that may manage devices and rules (people need the sensor-admin role through heain-gateway)")
 	notifyApp := flag.String("notify-app", "heain-notify", "the app that sends alerts")
-	retention := flag.Duration("retention", 30*24*time.Hour, "readings older than this are removed")
+	retention := flag.Duration("retention", 30*24*time.Hour, "readings older than this are removed (at most 400 days, the manifest's ceiling)")
+	noticeMax := flag.Duration("notice-max-age", 24*time.Hour, "an alert notice heain-notify never took is given up after this (it is kept and retried until then)")
 	rate := flag.Int("rate-per-min", 120, "posts per device per minute")
 	poll := flag.Duration("poll", 3*time.Second, "how often P5 decisions are checked")
 	flag.Parse()
+	if *retention <= 0 || *retention > 400*24*time.Hour {
+		log.Fatal("heain-sensor: -retention must be between 1s and 400 days (the manifest's ceiling)")
+	}
 	if *devCert == "" || *devKey == "" {
 		log.Fatal("heain-sensor: -device-cert and -device-key are required (devices post over HTTPS)")
 	}
@@ -75,7 +79,7 @@ func main() {
 		}
 	}
 	eng := sensor.New(&sensor.Engine{Store: st, Plat: app, Logf: log.Printf,
-		Cfg: sensor.Config{AdminCallers: admins, NotifyApp: *notifyApp, Retention: *retention, RatePerMin: *rate, PollEvery: *poll}})
+		Cfg: sensor.Config{AdminCallers: admins, NotifyApp: *notifyApp, Retention: *retention, RatePerMin: *rate, PollEvery: *poll, NoticeMaxAge: *noticeMax}})
 	go eng.Run(ctx)
 	dev := &http.Server{Addr: *devListen, Handler: eng.DeviceHandler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
 		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{pair}}}

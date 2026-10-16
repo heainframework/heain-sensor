@@ -7,7 +7,9 @@
 #  - an alert rule waits for P5, then raises and resolves (heain-notify email, formal events in core); a silence rule;
 #  - commands: a controller app queues one, the device picks it up in its answer and reports back; a risky one waits for P5;
 #  - key rotation and revocation; deletion destroys the device's key; nothing plaintext at rest; the audit chain verifies.
-# Needs ~/heain-core, ~/heain-sdk, ~/heain-notify. ~2 min.
+#  - v1.1 (2026-10-17): heain-notify down while an alert is raised -- the notice is kept and delivered once notify is back
+#    (idempotency key); a cautious stand-in rule on a second gauge counts only while the first is silent.
+# Needs ~/heain-core, ~/heain-sdk, ~/heain-notify (v1.1). ~3 min.
 # Run from ~/heain-sensor:  bash scripts/live_4_6g.sh
 set -uo pipefail
 SN=$(cd "$(dirname "$0")/.." && pwd)
@@ -60,6 +62,7 @@ waitsink() { for k in $(seq 1 ${2:-30}); do [ "$(sinks "$1")" -ge "${3:-1}" ] 2>
 # the device: dev [key] [extra flags] -> {"status","signed","answer"}
 KEY=""
 dev() { local k=${1:-$KEY}; shift; NO_PROXY='*' "$W/device-sim" -url $DURL -ca "$W/dev.pem" -id gh-1 -key "$k" -seq-file "$W/gh-1.seq" "$@" 2>&1; }
+dev2() { NO_PROXY='*' "$W/device-sim" -url $DURL -ca "$W/dev.pem" -id gh-2 -key "$KEY2" -seq-file "$W/gh-2.seq" "$@" 2>&1; }
 st() { echo "$1" | j "d['status']"; }
 events() { audit | j "sum(1 for x in d['records'] if x['event']['Action']=='app.event' and x['event']['Detail']['capability']=='$1' and x['event']['Result']=='$2')"; }
 waitev() { for k in $(seq 1 ${4:-15}); do [ "$(events "$1" "$2")" -ge "$3" ] 2>/dev/null && return 0; sleep 1; done; return 1; }
@@ -133,6 +136,34 @@ dev "$KEY" -readings hum=50 >/dev/null; waitev sensor.alert alert_resolved 2 && 
 r=$(cl ops.c1 -X DELETE $SURL/v1/rules/quiet); approve "$(echo "$r" | j "d['action_id']")" >/dev/null
 for k in $(seq 1 10); do [ "$(cl ops.c1 $SURL/v1/rules | j "len(d['rules'])")" = 1 ] && break; sleep 1; done
 [ "$(cl ops.c1 $SURL/v1/rules | j "[r['id'] for r in d['rules']]")" = "['hot']" ] && ok "removing a rule went through P5 too" || bad "rule delete"
+
+echo "== 4b. v1.1: notify down; a cautious stand-in while a gauge is silent"
+R0=$(events sensor.alert alert_raised); M0=$(sinks "r['to']=='ops@example.test' and 'Sensor alert hot: gh-1' in r['body']")
+kill "$(cat "$P/n1.pid")" 2>/dev/null; sleep 2
+dev "$KEY" -readings temp=50 >/dev/null; dev "$KEY" -readings temp=51 >/dev/null
+waitev sensor.alert alert_raised $((R0+1)) && waitev sensor.alert notice_queued 1 \
+  && [ "$(cl ops.c1 $SURL/v1/notices | j "len(d['pending'])")" = 1 ] && ok "heain-notify down: the alert is raised, its notice kept (GET /v1/notices: 1 pending, notice_queued audited)" || bad "queued: $(cl ops.c1 $SURL/v1/notices)"
+runapp n1 "$NTDIR/heain-app.yaml" 19520 "$W/state-n1" "$W/heain-notify" -admin-callers ops -smtp-addr 127.0.0.1:18525 -smtp-from heain@example.test -smtp-mode plain
+for k in $(seq 1 30); do for a in $(pending app.register); do approve $a >/dev/null; done; [ "$(grep -c "heain-notify: active" "$W/n1.log")" -ge 2 ] && break; sleep 1; done
+waitsink "r['to']=='ops@example.test' and 'Sensor alert hot: gh-1' in r['body']" 60 $((M0+1)) && waitev sensor.alert notice_delivered_late 1 30 \
+  && [ "$(cl ops.c1 $SURL/v1/notices | j "len(d['pending'])")" = 0 ] && ok "heain-notify back: the kept notice was delivered (late, audited), nothing pending" || bad "late delivery: $(cl ops.c1 $SURL/v1/notices)"
+sleep 3
+[ "$(sinks "r['to']=='ops@example.test' and 'Sensor alert hot: gh-1' in r['body']")" = $((M0+1)) ] && ok "delivered once (the retries carried the same idempotency key)" || bad "duplicates: $(sinks "r['to']=='ops@example.test' and 'Sensor alert hot: gh-1' in r['body']")"
+dev "$KEY" -readings temp=22 >/dev/null
+r=$(cl ops.c1 -X POST -d '{"id":"gh-2","name":"stand-in","type":"greenhouse","metrics":[{"name":"temp","unit":"C"}],"readers":["dash"]}' $SURL/v1/devices); KEY2=$(echo "$r" | j "d['key']")
+r=$(cl ops.c1 -X PUT -d '{"device":"gh-2","kind":"threshold","metric":"temp","op":">","value":30,"severity":"critical","notify":["group:ops-team"],"while_silent":{"device":"gh-1","for":"6s"}}' $SURL/v1/rules/cautious)
+approve "$(echo "$r" | j "d['action_id']")" >/dev/null
+for k in $(seq 1 10); do [ "$(cl ops.c1 $SURL/v1/rules | j "[r['active'] is not None for r in d['rules'] if r['id']=='cautious'][0]")" = True ] && break; sleep 1; done
+R1=$(events sensor.alert alert_raised)
+dev "$KEY" -readings temp=23 >/dev/null; dev2 -readings temp=35 >/dev/null; sleep 2
+[ -n "$KEY2" ] && [ "$(events sensor.alert alert_raised)" = "$R1" ] && ok "rule cautious (gh-2 > 30 while gh-1 is silent for 6 s), approved through P5: gh-1 reports, gh-2 at 35 does not count" || bad "stand-in counted early"
+sleep 7; dev2 -readings temp=35 >/dev/null
+waitev sensor.alert alert_raised $((R1+1)) && waitsink "r['to']=='ops@example.test' and 'Sensor alert cautious: gh-2' in r['body']" 20 \
+  && ok "gh-1 silent for 6 s: gh-2 at 35 raises the stand-in alert, ops-team told" || bad "stand-in: $(events sensor.alert alert_raised)"
+X0=$(events sensor.alert alert_resolved); dev "$KEY" -readings temp=24 >/dev/null; dev2 -readings temp=36 >/dev/null
+waitev sensor.alert alert_resolved $((X0+1)) && ok "gh-1 back: the stand-in stops counting, its alert resolved" || bad "stand-in resolve"
+r=$(cl ops.c1 -X DELETE $SURL/v1/rules/cautious); approve "$(echo "$r" | j "d['action_id']")" >/dev/null
+for k in $(seq 1 10); do [ "$(cl ops.c1 $SURL/v1/rules | j "len(d['rules'])")" = 1 ] && break; sleep 1; done
 
 echo "== 5. commands"
 [ "$(ccode dash.d1 -X POST -d '{"name":"fan"}' $SURL/v1/devices/gh-1/commands)" = 403 ] && ok "a reader app cannot send commands" || bad "dash command"

@@ -68,6 +68,7 @@ type Config struct {
 	RatePerMin   int           // posts per device per minute (default 120)
 	CommandTTL   time.Duration // default 1 hour
 	PollEvery    time.Duration
+	NoticeMaxAge time.Duration // v1.1: a notice heain-notify never took is given up after this (default 24 h)
 }
 
 // Engine is heain-sensor.
@@ -111,6 +112,9 @@ func New(e *Engine) *Engine {
 	if c.PollEvery <= 0 {
 		c.PollEvery = 3 * time.Second
 	}
+	if c.NoticeMaxAge <= 0 {
+		c.NoticeMaxAge = 24 * time.Hour
+	}
 	e.rate, e.authFail = map[string][]time.Time{}, map[string]time.Time{}
 	return e
 }
@@ -125,16 +129,75 @@ func (e *Engine) audit(ctx context.Context, cap, outcome string, d map[string]an
 	}
 }
 
+// tell hands an alert notice to heain-notify (v1.1): the notice is kept
+// until heain-notify takes it, so a notify instance that is down or
+// restarting delays the notice but does not lose it; the idempotency key
+// makes a retry after a lost answer the same message.
 func (e *Engine) tell(ctx context.Context, to []string, kind, title, ref, sev string) {
 	if len(to) == 0 {
 		return
 	}
+	now := e.Now().UTC()
+	n := Notice{ID: heain.NewID(), To: to, Kind: kind, Title: title, Ref: ref, Severity: sev, Next: now, Created: now}
+	e.mu.Lock()
+	err := e.Store.PutNotice(n)
+	e.mu.Unlock()
+	if err != nil {
+		e.Logf("heain-sensor: keeping a notice: %v", err)
+	}
+	e.send(ctx, n)
+}
+
+var noticeBackoff = []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second, time.Minute, 2 * time.Minute, 5 * time.Minute}
+
+// send tries one notice; it is removed once heain-notify has taken it.
+func (e *Engine) send(ctx context.Context, n Notice) {
 	var out map[string]any
-	if _, err := e.Plat.Call(ctx, heain.CallSpec{App: e.Cfg.NotifyApp, Capability: "notify.send", Method: http.MethodPost, Path: "/v1/messages",
-		Body: map[string]any{"to": to, "kind": kind, "title": title, "ref": ref, "severity": sev}, Out: &out}); err != nil {
-		e.Logf("heain-sensor: telling %v: %v", to, err)
+	_, err := e.Plat.Call(ctx, heain.CallSpec{App: e.Cfg.NotifyApp, Capability: "notify.send", Method: http.MethodPost, Path: "/v1/messages",
+		Body: map[string]any{"to": n.To, "kind": n.Kind, "title": n.Title, "ref": n.Ref, "severity": n.Severity, "idempotency_key": n.ID}, Out: &out})
+	now := e.Now().UTC()
+	n.Attempts++
+	outcome, det := "", map[string]any{"ref": n.Ref, "kind": n.Kind, "attempts": n.Attempts}
+	e.mu.Lock()
+	switch {
+	case err == nil:
+		_ = e.Store.DelNotice(n.ID)
+		if n.Attempts > 1 {
+			outcome, det["delay_s"] = "notice_delivered_late", int(now.Sub(n.Created).Seconds())
+		}
+	case now.Sub(n.Created) > e.Cfg.NoticeMaxAge:
+		_ = e.Store.DelNotice(n.ID)
+		outcome, det["error"] = "notice_given_up", trim(err.Error(), 200)
+	default:
+		b := noticeBackoff[len(noticeBackoff)-1]
+		if n.Attempts-1 < len(noticeBackoff) {
+			b = noticeBackoff[n.Attempts-1]
+		}
+		n.Next, n.LastErr = now.Add(b), trim(err.Error(), 200)
+		_ = e.Store.PutNotice(n)
+		if n.Attempts == 1 {
+			outcome, det["error"] = "notice_queued", trim(err.Error(), 200)
+		}
+	}
+	e.mu.Unlock()
+	if outcome != "" {
+		e.Logf("heain-sensor: notice %s (%s): %s after %d attempt(s)", n.ID, n.Ref, outcome, n.Attempts)
+		e.audit(ctx, "sensor.alert", outcome, det)
 	}
 }
+
+// resend retries the notices whose time has come.
+func (e *Engine) resend(ctx context.Context) {
+	now := e.Now()
+	for _, n := range e.Store.Notices() {
+		if !now.Before(n.Next) {
+			e.send(ctx, n)
+		}
+	}
+}
+
+// Pending lists the notices heain-notify has not taken yet.
+func (e *Engine) Pending() []Notice { return e.Store.Notices() }
 
 func in(l []string, s string) bool {
 	for _, x := range l {
@@ -499,6 +562,14 @@ func validRule(s RuleSpec) error {
 	case len(s.Notify) > 16:
 		return invalid("notify: at most 16 heain-notify targets")
 	}
+	if s.WhileSilent != nil {
+		if s.Kind != "threshold" || !idRe.MatchString(s.WhileSilent.Device) {
+			return invalid("while_silent: a threshold rule only, naming a device id")
+		}
+		if d, err := time.ParseDuration(s.WhileSilent.For); err != nil || d < time.Second {
+			return invalid("while_silent.for: a duration such as 10m")
+		}
+	}
 	if s.Kind == "silence" {
 		if d, err := time.ParseDuration(s.For); err != nil || d < time.Second {
 			return invalid("a silence rule needs for: a duration such as 5m")
@@ -538,6 +609,9 @@ func (e *Engine) ProposeRule(ctx context.Context, id string, s *RuleSpec, del bo
 	data := map[string]any{"rule": id, "delete": del, "by": by}
 	if s != nil {
 		data["kind"], data["device"], data["metric"], data["op"], data["value"], data["severity"] = s.Kind, s.Device, s.Metric, s.Op, s.Value, s.Severity
+		if s.WhileSilent != nil {
+			data["while_silent"] = map[string]any{"device": s.WhileSilent.Device, "for": s.WhileSilent.For}
+		}
 	}
 	res, err := e.Plat.Propose(ctx, heain.Proposal{Type: "sensor.rule.change", Category: heain.CategoryKnowledgeUpdate, Data: data})
 	if err != nil {
@@ -594,12 +668,13 @@ func (e *Engine) evaluate(ctx context.Context, d Device, rs []Reading) {
 		if s.For != "" {
 			need, _ = strconv.Atoi(s.For)
 		}
+		counts := e.silentFor(*s)
 		for _, rd := range rs {
 			if rd.Metric != s.Metric || rd.Implausible {
 				continue
 			}
 			over := (s.Op == ">" && rd.Value > s.Value) || (s.Op == ">=" && rd.Value >= s.Value) || (s.Op == "<" && rd.Value < s.Value) || (s.Op == "<=" && rd.Value <= s.Value)
-			e.transition(ctx, r.ID, *s, d, over, need, rd.Value)
+			e.transition(ctx, r.ID, *s, d, over && counts, need, rd.Value)
 		}
 	}
 }
@@ -642,6 +717,24 @@ func (e *Engine) transition(ctx context.Context, rule string, s RuleSpec, d Devi
 	}
 	e.audit(ctx, "sensor.alert", outcome, det)
 	e.tell(ctx, s.Notify, "sensor."+outcome, title, key, sev)
+}
+
+// silentFor: a rule without while_silent always counts; one with it counts
+// only while the named device has been silent long enough (v1.1).
+func (e *Engine) silentFor(s RuleSpec) bool {
+	if s.WhileSilent == nil {
+		return true
+	}
+	d, err := e.Store.Device(s.WhileSilent.Device)
+	if err != nil {
+		return true // the watched device is gone: as silent as it gets
+	}
+	dur, _ := time.ParseDuration(s.WhileSilent.For)
+	since := d.LastSeen
+	if since.IsZero() {
+		since = d.Created
+	}
+	return e.Now().Sub(since) > dur
 }
 
 // silences checks the silence rules.
@@ -779,6 +872,7 @@ func (e *Engine) Tick(ctx context.Context) {
 		e.last = now
 		e.pollRules(ctx)
 		e.pollCommands(ctx)
+		e.resend(ctx)
 	}
 	e.silences(ctx)
 }

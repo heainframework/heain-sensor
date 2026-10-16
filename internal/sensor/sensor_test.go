@@ -28,6 +28,7 @@ type fake struct {
 	messages []map[string]any
 	audits   []string
 	traces   []string
+	down     int // the next calls fail (heain-notify unreachable)
 }
 
 func (f *fake) Propose(_ context.Context, p heain.Proposal) (heain.PolicyResult, error) {
@@ -56,6 +57,10 @@ func (f *fake) PolicyStatus(_ context.Context, id string) (heain.PolicyResult, e
 func (f *fake) Call(_ context.Context, cs heain.CallSpec) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.down > 0 {
+		f.down--
+		return 0, errors.New("heain-notify unreachable")
+	}
 	raw, _ := json.Marshal(cs.Body)
 	var m map[string]any
 	_ = json.Unmarshal(raw, &m)
